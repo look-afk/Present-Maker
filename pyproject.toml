@@ -1,0 +1,14 @@
+[project]
+name = "presentation-bot"
+version = "0.4.0"
+description = "A Telegram bot that researches topics and creates PowerPoint presentations"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "aiogram>=3.20,<4",
+  "beautifulsoup4>=4.13,<5",
+  "python-dotenv>=1.1,<2",
+  "python-pptx>=1.0.2,<2",
+  "pypdf>=5.0,<7",
+  "requests>=2.32,<3",
+]

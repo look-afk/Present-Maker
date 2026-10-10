@@ -42,6 +42,10 @@ def load_state():
         recipient_links.update({str(k): v for k, v in data.get("recipient_links", {}).items()})
         recipients.update({int(k): v for k, v in data.get("recipients", {}).items()})
         auto_send_recipient.update({int(k): bool(v) for k, v in data.get("auto_send_recipient", {}).items()})
+        user_settings.update({
+            int(k): v for k, v in data.get("user_settings", {}).items()
+            if isinstance(v, dict)
+        })
     except (OSError, ValueError, TypeError) as exc:
         log.warning("Could not load bot state: %s", exc)
 
@@ -52,6 +56,7 @@ def save_state():
             "recipient_links": recipient_links,
             "recipients": {str(k): v for k, v in recipients.items()},
             "auto_send_recipient": {str(k): v for k, v in auto_send_recipient.items()},
+            "user_settings": {str(k): v for k, v in user_settings.items()},
         }, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         log.exception("Could not save bot state")
@@ -187,6 +192,14 @@ async def add_recipient(message: Message):
 async def open_setting(callback: CallbackQuery):
     group = callback.data.split(":", 1)[1]
     s = get_settings(callback.from_user.id)
+    if group == "home":
+        await callback.answer()
+        await callback.message.edit_text(
+            f"Настройки презентации\nОформление: {STYLES[s['style']]}\nПодробность: {DETAILS[s['detail']]}\n"
+            f"Подача: {STRUCTURES[s['structure']]}\nВизуал: {VISUALS[s['visuals']]}\nСлайдов: {s['slides']}",
+            reply_markup=settings_keyboard(callback.from_user.id),
+        )
+        return
     configs = {
         "styles": ("style", STYLES, "Выбери оформление:"),
         "details": ("detail", DETAILS, "Насколько подробной должна быть презентация?"),
@@ -210,6 +223,7 @@ async def choose_setting(callback: CallbackQuery):
         await callback.answer("Неизвестная настройка", show_alert=True); return
     s = get_settings(callback.from_user.id)
     s[key] = int(value) if key == "slides" else value
+    save_state()
     await callback.answer("Сохранено")
     await callback.message.edit_text("Настройка сохранена. Можешь изменить другой параметр:", reply_markup=settings_keyboard(callback.from_user.id))
 

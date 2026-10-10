@@ -74,6 +74,14 @@ def _create_pptx_with_theme(topic,lang,content,sources,output_path,settings):
         add_text(slide,item.get("title","Key idea"),.98,.62,10.7,.85,25,WHITE,True)
         rect(slide,.85,1.65,7.75,4.95,PANEL)
         body=(item.get("body") or "\n\n".join(str(x) for x in item.get("bullets",[]))).strip()
+        if not body:
+            body = "\n\n".join(
+                str(item.get(key, "")).strip()
+                for key in ("example", "takeaway", "highlight")
+                if str(item.get(key, "")).strip()
+            )
+        if not body:
+            raise ValueError(f"Слайд {idx + 1} «{item.get('title', 'Без названия')}» пустой; PPTX не сохранён.")
         words=len(body.split()); body_size=16 if words<90 else 14.5 if words<125 else 13 if words<165 else 11.5
         add_text(slide,body,1.12,1.92,7.2,4.38,body_size,WHITE)
         rect(slide,8.9,1.65,3.55,4.95,RGBColor(17,27,45))

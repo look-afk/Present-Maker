@@ -3,6 +3,8 @@ import logging
 import os
 import re
 from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -193,9 +195,33 @@ async def topic_received(message: Message):
         busy_users.discard(user_id)
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/", "/health"):
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"Not found")
+            return
+        body = b"Present-Maker is running"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в .env")
+        raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в Environment Variables")
+
+    port = int(os.getenv("PORT", "10000"))
+    http_server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    Thread(target=http_server.serve_forever, daemon=True).start()
+    log.info("Health server listening on 0.0.0.0:%s", port)
+
     bot = Bot(BOT_TOKEN)
     log.info("Presentation bot started")
     await dp.start_polling(bot)

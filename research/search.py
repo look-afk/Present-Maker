@@ -99,19 +99,84 @@ def wikimedia_images(query, limit=4):
     return out
 
 
+def _query_variants(topic):
+    """Build progressively broader search queries for long or very specific topics."""
+    topic = re.sub(r"\s+", " ", (topic or "").strip())
+    variants = []
+    if topic:
+        variants.append(topic)
+
+    simplified = re.sub(
+        r"^(почему|как|что такое|расскажи о|расскажите о|подготовь презентацию о|презентация о|why|how|what is|tell me about|make a presentation about)\s+",
+        "",
+        topic,
+        flags=re.I,
+    ).strip(" .,:;!?")
+    if simplified and simplified.casefold() not in {v.casefold() for v in variants}:
+        variants.append(simplified)
+
+    # A long sentence often returns no results; try its main keywords as a fallback.
+    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9'-]*", simplified or topic)
+    stop_words = {
+        "the", "and", "for", "with", "from", "about", "into", "that", "this",
+        "что", "как", "для", "или", "это", "при", "над", "под", "его", "её",
+        "презентация", "презентацию", "сделай", "создай", "расскажи", "подготовь",
+    }
+    keywords = [word for word in words if word.casefold() not in stop_words]
+    if len(keywords) > 7:
+        broad = " ".join(keywords[:7])
+        if broad.casefold() not in {v.casefold() for v in variants}:
+            variants.append(broad)
+
+    # Avoid duplicate calls while preserving the most specific query first.
+    unique = []
+    seen = set()
+    for variant in variants:
+        key = variant.casefold()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(variant)
+    return unique[:3]
+
+
 def collect_sources(topic, diagnostics=None):
     diagnostics = diagnostics if diagnostics is not None else []
-    results=[]; seen=set(); cyrillic=bool(re.search(r"[А-Яа-яЁё]",topic)); langs=("ru","en") if cyrillic else ("en","ru")
-    queries=[topic]
-    simplified=re.sub(r"^(почему|как|что такое|why|how|what is)\s+", "", topic.strip(), flags=re.I).strip()
-    if simplified and simplified.lower()!=topic.lower(): queries.append(simplified)
-    for query in queries[:2]:
-        for name, fn in [(f"Wikipedia {langs[0]}",lambda q=query:wikipedia_search(q,langs[0],4)),(f"Wikipedia {langs[1]}",lambda q=query:wikipedia_search(q,langs[1],3)),("OpenAlex",lambda q=query:openalex_search(q,5)),("Wikimedia Commons",lambda q=query:wikimedia_images(q,3))]:
+    results = []
+    seen = set()
+    cyrillic = bool(re.search(r"[А-Яа-яЁё]", topic))
+    langs = ("ru", "en") if cyrillic else ("en", "ru")
+
+    for query in _query_variants(topic):
+        # Stop querying once enough usable text sources have been collected.
+        readable_count = sum(
+            1 for item in results
+            if item.get("source_type") != "image" and len(item.get("text", "")) >= 250
+        )
+        if readable_count >= 6:
+            break
+
+        connectors = [
+            (f"Wikipedia {langs[0]}", lambda q=query: wikipedia_search(q, langs[0], 4)),
+            (f"Wikipedia {langs[1]}", lambda q=query: wikipedia_search(q, langs[1], 3)),
+            ("OpenAlex", lambda q=query: openalex_search(q, 5)),
+            ("Wikimedia Commons", lambda q=query: wikimedia_images(q, 3)),
+        ]
+        for name, fn in connectors:
             try:
-                items=fn(); diagnostics.append(f"{name}: {len(items)} results")
+                items = fn()
+                diagnostics.append(f"{name} [{query[:70]}]: {len(items)} results")
                 for item in items:
-                    key=item.get("image_url") if item.get("source_type")=="image" else item.get("url")
-                    if key and key not in seen: seen.add(key); results.append(item)
-            except Exception as exc: diagnostics.append(f"{name}: {type(exc).__name__}: {exc}")
-    results.sort(key=lambda x:(x.get("source_type")=="image",len(x.get("text", ""))<500))
+                    key = item.get("image_url") if item.get("source_type") == "image" else item.get("url")
+                    if key and key not in seen:
+                        seen.add(key)
+                        results.append(item)
+            except Exception as exc:
+                diagnostics.append(f"{name} [{query[:45]}]: {type(exc).__name__}: {exc}")
+
+    results.sort(
+        key=lambda item: (
+            item.get("source_type") == "image",
+            len(item.get("text", "")) < 500,
+        )
+    )
     return results[:18]

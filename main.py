@@ -1,7 +1,9 @@
 import asyncio
+import json
 import logging
 import os
 import re
+import secrets
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -20,12 +22,42 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
+STATE_FILE = Path("bot_state.json")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 dp = Dispatcher()
 user_languages: dict[int, str] = {}
 user_settings: dict[int, dict] = {}
 busy_users: set[int] = set()
+recipient_links: dict[str, dict] = {}
+recipients: dict[int, dict] = {}
+auto_send_recipient: dict[int, bool] = {}
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        recipient_links.update({str(k): v for k, v in data.get("recipient_links", {}).items()})
+        recipients.update({int(k): v for k, v in data.get("recipients", {}).items()})
+        auto_send_recipient.update({int(k): bool(v) for k, v in data.get("auto_send_recipient", {}).items()})
+    except (OSError, ValueError, TypeError) as exc:
+        log.warning("Could not load bot state: %s", exc)
+
+
+def save_state():
+    try:
+        STATE_FILE.write_text(json.dumps({
+            "recipient_links": recipient_links,
+            "recipients": {str(k): v for k, v in recipients.items()},
+            "auto_send_recipient": {str(k): v for k, v in auto_send_recipient.items()},
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        log.exception("Could not save bot state")
+
+
+load_state()
 LANG_LABELS = {"ru": "русский", "en": "английский", "uz": "узбекский"}
 
 
@@ -47,6 +79,10 @@ def settings_keyboard(user_id):
     kb.button(text=f"Подача: {STRUCTURES[s['structure']]}", callback_data="setting:structures")
     kb.button(text=f"Визуал: {VISUALS[s['visuals']]}", callback_data="setting:visuals")
     kb.button(text=f"Слайдов: {s['slides']}", callback_data="setting:slides")
+    recipient = recipients.get(user_id)
+    recipient_label = recipient.get("name", "Получатель") if recipient else "не привязан"
+    auto_label = "вкл." if auto_send_recipient.get(user_id, False) else "выкл."
+    kb.button(text=f"Отправка: {recipient_label} ({auto_label})", callback_data="setting:recipient")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -88,6 +124,65 @@ async def settings_home(callback: CallbackQuery):
         reply_markup=settings_keyboard(callback.from_user.id))
 
 
+@dp.callback_query(F.data == "setting:recipient")
+async def recipient_setting(callback: CallbackQuery):
+    await callback.answer()
+    user_id = callback.from_user.id
+    recipient = recipients.get(user_id)
+    recipient_text = f"Текущий получатель: {recipient.get('name', 'Получатель')}." if recipient else "Получатель пока не привязан."
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Как привязать получателя", callback_data="recipient:help")
+    if recipient:
+        label = "Отключить автоотправку" if auto_send_recipient.get(user_id, False) else "Включить автоотправку"
+        kb.button(text=label, callback_data="recipient:toggle")
+    kb.button(text="Назад к настройкам", callback_data="setting:home")
+    kb.adjust(1)
+    await callback.message.edit_text(
+        "Автоматическая отправка готовых презентаций\n\n" + recipient_text +
+        "\n\nДля привязки отправь команду /addrecipient Мама. Перешли созданную ссылку маме; ей нужно открыть её и нажать Start. После привязки включи автоотправку здесь.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data == "recipient:help")
+async def recipient_help(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer("Отправь команду: /addrecipient Мама. Я создам ссылку; перешли её маме, чтобы она открыла бота и нажала Start.")
+
+
+@dp.callback_query(F.data == "recipient:toggle")
+async def recipient_toggle(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in recipients:
+        await callback.answer("Сначала привяжи получателя через /addrecipient Мама", show_alert=True)
+        return
+    auto_send_recipient[user_id] = not auto_send_recipient.get(user_id, False)
+    save_state()
+    await callback.answer("Настройка сохранена")
+    recipient = recipients[user_id]
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Как привязать получателя", callback_data="recipient:help")
+    kb.button(text="Отключить автоотправку" if auto_send_recipient[user_id] else "Включить автоотправку", callback_data="recipient:toggle")
+    kb.button(text="Назад к настройкам", callback_data="setting:home")
+    kb.adjust(1)
+    await callback.message.edit_text(
+        f"Получатель: {recipient.get('name', 'Получатель')}\nАвтоотправка: {'включена' if auto_send_recipient[user_id] else 'выключена'}.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.message(Command("addrecipient"))
+async def add_recipient(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    name = parts[1].strip()[:40] if len(parts) > 1 else "Получатель"
+    token = secrets.token_urlsafe(9)
+    recipient_links[token] = {"owner_id": message.from_user.id, "name": name}
+    save_state()
+    bot_username = (await message.bot.get_me()).username
+    link = f"https://t.me/{bot_username}?start=link_{token}"
+    await message.answer(f"Ссылка для привязки «{name}» создана. Перешли её получателю; ему нужно открыть её и нажать Start.\n\n{link}")
+
+
 @dp.callback_query(F.data.startswith("setting:"))
 async def open_setting(callback: CallbackQuery):
     group = callback.data.split(":", 1)[1]
@@ -121,6 +216,23 @@ async def choose_setting(callback: CallbackQuery):
 
 @dp.message(CommandStart())
 async def start(message: Message):
+    payload = (message.text or "").partition(" ")[2].strip()
+    if payload.startswith("link_"):
+        token = payload[len("link_"):]
+        link_data = recipient_links.pop(token, None)
+        if not link_data:
+            await message.answer("Ссылка недействительна или уже использована. Попроси владельца создать новую через /addrecipient.")
+            return
+        owner_id = int(link_data["owner_id"])
+        recipients[owner_id] = {"chat_id": message.chat.id, "name": link_data.get("name", "Получатель")}
+        auto_send_recipient.setdefault(owner_id, False)
+        save_state()
+        await message.answer("Готово. Ты привязан как получатель презентаций.")
+        try:
+            await message.bot.send_message(owner_id, f"Получатель «{link_data.get('name', 'Получатель')}» привязан. Включи автоотправку в /settings.")
+        except Exception:
+            log.exception("Could not notify owner about linked recipient")
+        return
     await message.answer(
         "Я создаю презентации: ищу материалы, анализирую источники и собираю PowerPoint.\n\n"
         "1. Выбери язык.\n2. Настрой оформление через /settings.\n3. Отправь тему одним сообщением.\n\n"
@@ -146,51 +258,97 @@ async def choose_language(callback: CallbackQuery):
     await callback.message.answer(f"Язык презентации: {LANG_LABELS[lang]}. Настройки доступны через /settings. Теперь отправь тему.")
 
 
-@dp.message(F.text)
-async def topic_received(message: Message):
-    user_id = message.from_user.id
-    topic = message.text.strip()
-    if topic.startswith("/"):
-        return
-    if user_id in busy_users:
-        await message.answer("Твоя предыдущая презентация ещё создаётся. Дождись её завершения.")
-        return
-    if user_id not in user_languages:
-        await message.answer("Сначала выбери язык:", reply_markup=language_keyboard())
-        return
-    if len(topic) < 3:
-        await message.answer("Напиши тему подробнее.")
-        return
-    if len(topic) > 250:
-        await message.answer("Тема слишком длинная. Ограничь её 250 символами.")
-        return
+def parse_topics(raw_text: str) -> list[str]:
+    topics = []
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip().rstrip("\\").strip()
+        if not line:
+            continue
+        line = line.replace("**", "").replace("__", "")
+        if " — " in line:
+            line = line.split(" — ", 1)[0].strip()
+        line = re.sub(r"^\s*(?:[-*•]\s*)?(?:\d+[.)]\s*)?", "", line).strip()
+        line = re.sub(r"\s*\((?:\d+\s*)?(?:soat|час(?:а|ов)?|hours?|hrs?)\)\s*$", "", line, flags=re.I).strip()
+        line = line.strip(" .;\\")
+        if len(line) >= 3 and not line.startswith("/"):
+            topics.append(line)
+    unique, seen = [], set()
+    for topic in topics:
+        if topic.casefold() not in seen:
+            seen.add(topic.casefold())
+            unique.append(topic)
+    return unique
 
-    busy_users.add(user_id)
-    status = await message.answer("Этап 1/5: ищу источники и иллюстрации…")
+
+async def generate_one(message: Message, topic: str, lang: str, index: int, total: int):
+    status = await message.answer(f"[{index}/{total}] Ищу источники: «{topic}»…")
     try:
-        lang = user_languages[user_id]
         diagnostics = []
         sources = await asyncio.to_thread(collect_sources, topic, diagnostics)
         readable = [s for s in sources if s.get("source_type") != "image" and len((s.get("text") or "").strip()) >= 250]
         if not readable:
-            details = "\n".join(diagnostics[-8:])[:1200] or "Источники не вернули текст."
+            details = "\n".join(diagnostics[-8:])[:1000] or "Источники не вернули текст."
             raise RuntimeError("Не удалось найти содержательные текстовые материалы.\n" + details)
-        await status.edit_text(f"Этап 2/5: найдено текстовых материалов — {len(readable)}, изображений — {sum(s.get('source_type') == 'image' for s in sources)}. Анализирую содержание и пишу конспект…")
-        settings = dict(get_settings(user_id))
+        await status.edit_text(f"[{index}/{total}] Найдено текстовых материалов: {len(readable)}. Создаю презентацию…")
+        settings = dict(get_settings(message.from_user.id))
         content = await asyncio.to_thread(generate_presentation_content, topic, lang, sources, settings)
-        await status.edit_text("Этап 3/5: создаю оформление слайдов…")
-        slug = re.sub(r"[^\w-]+", "_", topic, flags=re.UNICODE).strip("_")[:42] or "topic"
-        outdir = OUTPUT_DIR / str(user_id)
+        slug = re.sub(r"[^\w-]+", "_", topic, flags=re.UNICODE).strip("_")[:42] or f"topic_{index}"
+        outdir = OUTPUT_DIR / str(message.from_user.id)
         outdir.mkdir(parents=True, exist_ok=True)
-        pptx_path = outdir / f"{slug}.pptx"
+        pptx_path = outdir / f"{slug}_{index}.pptx"
         await asyncio.to_thread(create_pptx, topic, lang, content, sources, pptx_path, settings)
-        await status.edit_text("Этап 4/5: отправляю PowerPoint…")
-        await message.answer_document(FSInputFile(pptx_path), caption=f"Готово: {content.get('title', topic)}\nЯзык: {LANG_LABELS[lang]}\nТекстовых материалов: {len(readable)}\nСлайдов с объяснениями: {len(content.get('slides', []))}")
-        await status.edit_text("Этап 5/5: завершено. Отправь следующую тему или измени настройки через /settings.")
+        caption = f"Готово: {content.get('title', topic)}\nЯзык: {LANG_LABELS[lang]}\nТекстовых материалов: {len(readable)}\nСлайдов: {len(content.get('slides', []))}"
+        await message.answer_document(FSInputFile(pptx_path), caption=caption)
+        recipient = recipients.get(message.from_user.id)
+        if recipient and auto_send_recipient.get(message.from_user.id, False):
+            try:
+                await message.bot.send_document(chat_id=recipient["chat_id"], document=FSInputFile(pptx_path), caption=f"Презентация: {content.get('title', topic)}")
+            except Exception:
+                log.exception("Could not send presentation to linked recipient")
+                await message.answer("Файл готов, но отправить его получателю автоматически не удалось.")
+        await status.edit_text(f"[{index}/{total}] Готово.")
+        return True, None
     except Exception as exc:
-        log.exception("Presentation generation failed")
-        reason = str(exc).replace("<", "‹").replace(">", "›")[:650]
-        await status.edit_text("Не удалось создать презентацию.\n\nПричина: " + reason + "\n\nПроверь настройки .env и доступ к бесплатной модели.")
+        log.exception("Presentation generation failed for topic %r", topic)
+        reason = str(exc).replace("<", "‹").replace(">", "›")[:600]
+        await status.edit_text(f"[{index}/{total}] Не удалось создать «{topic}».\n\nПричина: {reason}")
+        return False, topic
+
+
+@dp.message(F.text)
+async def topic_received(message: Message):
+    user_id = message.from_user.id
+    raw_text = (message.text or "").strip()
+    if raw_text.startswith("/"):
+        return
+    if user_id in busy_users:
+        await message.answer("Предыдущая задача ещё выполняется. Дождись её завершения.")
+        return
+    if user_id not in user_languages:
+        await message.answer("Сначала выбери язык:", reply_markup=language_keyboard())
+        return
+    topics = parse_topics(raw_text)
+    if not topics:
+        await message.answer("Не удалось распознать темы. Отправь одну тему или список, по одной теме на строку.")
+        return
+    if len(topics) > 10:
+        await message.answer(f"В одном сообщении можно отправить не больше 10 тем. Распознано: {len(topics)}. Раздели список на несколько сообщений.")
+        return
+    if any(len(topic) > 250 for topic in topics):
+        await message.answer("Одна из тем длиннее 250 символов. Сократи её и отправь список повторно.")
+        return
+    busy_users.add(user_id)
+    try:
+        await message.answer(f"Принято тем: {len(topics)}. Создаю отдельные презентации по очереди.")
+        failed, lang = [], user_languages[user_id]
+        for index, topic in enumerate(topics, start=1):
+            success, failed_topic = await generate_one(message, topic, lang, index, len(topics))
+            if not success and failed_topic:
+                failed.append(failed_topic)
+        if failed:
+            await message.answer(f"Обработка завершена. Успешно: {len(topics) - len(failed)} из {len(topics)}.\nНе удалось создать:\n" + "\n".join(f"• {topic}" for topic in failed))
+        else:
+            await message.answer(f"Готово: все {len(topics)} презентаций созданы.")
     finally:
         busy_users.discard(user_id)
 

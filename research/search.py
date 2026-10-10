@@ -179,4 +179,7 @@ def collect_sources(topic, diagnostics=None):
             len(item.get("text", "")) < 500,
         )
     )
-    return results[:18]
+    text_results = [item for item in results if item.get("source_type") != "image"]
+    image_results = [item for item in results if item.get("source_type") == "image"]
+    # Keep image results alongside evidence text instead of truncating them away.
+    return text_results[:12] + image_results[:6]

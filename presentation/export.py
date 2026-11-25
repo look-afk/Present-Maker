@@ -1,124 +1,121 @@
-"""Editable PowerPoint export optimized for explanatory study-note slides."""
+"""Multi-layout editable PowerPoint renderer."""
 from pathlib import Path
 from io import BytesIO
-import requests
+import re, threading, requests
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
-import threading
-_RENDER_LOCK = threading.Lock()
+from pptx.enum.text import MSO_ANCHOR
 
-BG=RGBColor(12,18,32); PANEL=RGBColor(24,34,54); PANEL2=RGBColor(31,45,70)
-ACCENT=RGBColor(102,183,255); WHITE=RGBColor(246,248,252); MUTED=RGBColor(174,188,210); GREEN=RGBColor(123,226,191)
-
-
-def background(slide,color=BG):
-    slide.background.fill.solid(); slide.background.fill.fore_color.rgb=color
-
-
-def add_text(slide,value,x,y,w,h,size=18,color=WHITE,bold=False,font="Aptos",italic=False):
-    shape=slide.shapes.add_textbox(Inches(x),Inches(y),Inches(w),Inches(h)); tf=shape.text_frame
-    tf.clear(); tf.word_wrap=True
-    tf.margin_left=Inches(.06); tf.margin_right=Inches(.06); tf.margin_top=Inches(.04); tf.margin_bottom=Inches(.03)
-    p=tf.paragraphs[0]; p.text=str(value); p.font.name=font; p.font.size=Pt(size); p.font.bold=bold; p.font.italic=italic; p.font.color.rgb=color
-    return shape
-
-
-def rect(slide,x,y,w,h,color,rounded=True):
-    shape=slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE if rounded else MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
-    shape.fill.solid(); shape.fill.fore_color.rgb=color; shape.line.fill.background(); return shape
-
-
-def add_image(slide,item,x,y,w,h):
-    url=item.get("image_url")
-    if not url:return False
-    try:
-        r=requests.get(url,timeout=10,headers={"User-Agent":"PresentationBot/1.0"}); r.raise_for_status()
-        if len(r.content)>12_000_000:return False
-        slide.shapes.add_picture(BytesIO(r.content), Inches(x), Inches(y), width=Inches(w), height=Inches(h)); return True
-    except Exception:return False
-
-
+LOCK=threading.Lock()
+PALETTES={
+"dark":(RGBColor(12,18,32),RGBColor(24,34,54),RGBColor(31,45,70),RGBColor(102,183,255),RGBColor(246,248,252),RGBColor(174,188,210),RGBColor(123,226,191)),
+"academic":(RGBColor(250,247,239),RGBColor(255,255,255),RGBColor(238,231,216),RGBColor(38,83,112),RGBColor(37,43,49),RGBColor(104,109,111),RGBColor(73,124,93)),
+"minimal":(RGBColor(248,249,251),RGBColor(255,255,255),RGBColor(235,239,244),RGBColor(39,91,140),RGBColor(30,38,48),RGBColor(100,112,125),RGBColor(38,125,103)),
+"colorful":(RGBColor(29,20,56),RGBColor(47,34,81),RGBColor(67,47,105),RGBColor(255,112,92),RGBColor(255,250,247),RGBColor(218,204,230),RGBColor(111,222,190)),
+"classic":(RGBColor(250,247,239),RGBColor(255,255,255),RGBColor(238,231,216),RGBColor(38,83,112),RGBColor(37,43,49),RGBColor(104,109,111),RGBColor(73,124,93))}
+def bg(s,c): s.background.fill.solid(); s.background.fill.fore_color.rgb=c
+def box(s,x,y,w,h,c,rounded=True):
+ sh=s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE if rounded else MSO_SHAPE.RECTANGLE, Inches(x),Inches(y),Inches(w),Inches(h)); sh.fill.solid(); sh.fill.fore_color.rgb=c; sh.line.fill.background(); return sh
+def txt(s,v,x,y,w,h,size=16,c=None,bold=False,italic=False,margin=.07):
+ sh=s.shapes.add_textbox(Inches(x),Inches(y),Inches(w),Inches(h)); tf=sh.text_frame; tf.clear(); tf.word_wrap=True; tf.vertical_anchor=MSO_ANCHOR.TOP; tf.margin_left=tf.margin_right=Inches(margin); tf.margin_top=tf.margin_bottom=Inches(margin); p=tf.paragraphs[0]; p.text=str(v or ""); p.font.name="Aptos"; p.font.size=Pt(size); p.font.bold=bold; p.font.italic=italic
+ if c:p.font.color.rgb=c
+ return sh
+def image(s,item,x,y,w,h):
+ try:
+  r=requests.get(item.get("image_url",""),timeout=8,headers={"User-Agent":"PresentMaker/2"}); r.raise_for_status()
+  if len(r.content)>12_000_000:return False
+  pic=s.shapes.add_picture(BytesIO(r.content),Inches(x),Inches(y),width=Inches(w),height=Inches(h))
+  iw,ih=pic.image.size; ratio=w/h; sr=iw/ih
+  if sr>ratio: crop=(1-ratio/sr)/2; pic.crop_left=pic.crop_right=crop
+  elif sr<ratio: crop=(1-sr/ratio)/2; pic.crop_top=pic.crop_bottom=crop
+  return True
+ except Exception:return False
+def body_of(item):
+ body=str(item.get("body") or "").strip()
+ if not body and item.get("bullets"): body="\n".join("• "+str(v) for v in item["bullets"])
+ if not body: body="\n\n".join(str(item.get(k,"")).strip() for k in ("example","takeaway","highlight") if str(item.get(k,"")).strip())
+ if not body: raise ValueError("A slide has no content.")
+ return body
+def layout_of(item,i):
+ v=str(item.get("layout") or item.get("visual") or "").lower()
+ aliases={"diagram":"cards","comparison":"compare","conclusion":"closing","stats":"stats"}
+ v=aliases.get(v,v)
+ if v in ("cards","image","compare","timeline","quote","stats","closing","split"):return v
+ return ["split","cards","image","compare"][i%4]
+def cover(prs,topic,content,imgs,p):
+ B,P,P2,A,T,M,G=p;s=prs.slides.add_slide(prs.slide_layouts[6]);bg(s,B);box(s,.65,.65,.12,6.15,A,False);txt(s,"PRESENT-MAKER / STUDY",1.05,.85,6,.4,11,G,True);txt(s,content.get("title") or topic,1.05,1.65,7.1,2.8,35,T,True);txt(s,content.get("subtitle") or "Research-based explanatory presentation",1.08,4.6,6.8,1,18,M);box(s,8.35,.65,4.3,6.15,P)
+ if not imgs or not image(s,imgs[0],8.6,.95,3.8,3.1): box(s,9.1,1.5,2.5,2.5,P2);box(s,9.8,2.2,1.4,1.4,A)
+ txt(s,"LECTURE • EXPLAIN • EXPLORE",8.65,4.55,3.6,.4,10,A,True);txt(s,"Generated research notes",8.65,5.05,3.5,.7,16,T)
+def header(s,item,i,p):
+ B,P,P2,A,T,M,G=p;txt(s,f"SECTION {i+1:02d}",.82,.48,2.8,.3,10,G,True);txt(s,item.get("title","Key idea"),.82,.88,11.65,1.05,27,T,True);box(s,.82,1.95,.72,.045,A,False)
+def split(s,item,b,imgs,i,p):
+ B,P,P2,A,T,M,G=p;box(s,.78,2.25,7.1,4.45,P);txt(s,b,.98,2.48,6.72,4,15,T);box(s,8.12,2.25,4.42,4.45,P2);img=imgs[(i+1)%len(imgs)] if imgs else None;y=2.55
+ if img and image(s,img,8.38,2.48,3.92,2.35): y=5.05
+ else:txt(s,str(item.get("visual","CORE IDEA")).upper(),8.45,2.68,3.8,.5,13,A,True);y=3.5
+ ex=str(item.get("example","")).strip();take=str(item.get("takeaway") or item.get("highlight") or "")
+ if ex:txt(s,"EXAMPLE",8.45,y,3.8,.25,9,G,True);txt(s,ex,8.45,y+.32,3.75,1,11,T);y+=1.35
+ if take:txt(s,"KEY TAKEAWAY",8.45,y,3.8,.25,9,A,True);txt(s,take,8.45,y+.32,3.75,.85,11,T,True)
+def cards(s,item,b,p):
+ B,P,P2,A,T,M,G=p; items=item.get("bullets") or [v.strip() for v in re.split(r"\n+|(?<=[.!?])\s+",b) if v.strip()];items=items[:4] or [b];cols=2 if len(items)>2 else len(items);cw=(11.7-(cols-1)*.28)/cols;ch=2
+ for i,v in enumerate(items):
+  x=.82+(i%cols)*(cw+.28);y=2.25+(i//cols)*(ch+.25);box(s,x,y,cw,ch,P);box(s,x+.22,y+.22,.52,.04,A,False);txt(s,f"{i+1:02d}",x+.24,y+.42,.6,.4,14,G,True);txt(s,v,x+.24,y+.88,cw-.48,ch-.94,14,T)
+ take=str(item.get("takeaway") or item.get("highlight") or "")
+ if take:box(s,.82,6.55,11.7,.38,P2);txt(s,take,.98,6.59,11.3,.26,10,A,True)
+def compare(s,item,b,p):
+ B,P,P2,A,T,M,G=p;parts=[str(v) for v in (item.get("bullets") or re.split(r"\n+|(?<=[.!?])\s+",b)) if str(v).strip()][:2]
+ while len(parts)<2:parts.append(b)
+ for i,v in enumerate(parts):x=.82+i*5.92;box(s,x,2.25,5.72,4.45,P if i==0 else P2);txt(s,"SIDE "+str(i+1),x+.3,2.55,4.9,.35,10,A if i==0 else G,True);txt(s,v,x+.3,3,5,3.2,16,T,True)
+ take=str(item.get("takeaway") or item.get("highlight") or "")
+ if take:txt(s,take,.95,6.72,11.3,.28,11,A,True)
+def timeline(s,item,b,p):
+ B,P,P2,A,T,M,G=p;items=item.get("bullets") or [v.strip() for v in b.splitlines() if v.strip()];items=items[:5];box(s,1.15,3.8,10.9,.05,A,False);space=10.9/max(1,len(items))
+ for i,v in enumerate(items):
+  x=1.15+i*space;box(s,x,3.72,.22,.22,A);y=2.5 if i%2==0 else 4.4;box(s,x-.18,y,.12,1,G if i%2 else A,False);txt(s,v,x+.12,y,space-.25,1.35,12,T,True)
+def quote(s,item,b,p):
+ B,P,P2,A,T,M,G=p;box(s,.82,2.25,11.7,4.45,P);txt(s,"“",1.2,2.55,1,.8,44,A,True);txt(s,item.get("quote") or b,1.8,3,9.4,2.7,24,T,True,True);txt(s,item.get("author",""),1.8,5.85,8,.4,12,G,True)
+def stats(s,item,b,p):
+ B,P,P2,A,T,M,G=p;metrics=item.get("metrics") or [{"label":"Main point","value":str(item.get("takeaway") or b[:80])}];metrics=metrics[:3];w=11.7/len(metrics)
+ for i,m in enumerate(metrics):x=.82+i*w;box(s,x,2.25,w-.2,2.65,P);txt(s,m.get("value",""),x+.25,2.65,w-.6,1,24,A,True);txt(s,m.get("label",""),x+.25,3.8,w-.6,.75,13,T)
+ box(s,.82,5.15,11.7,1.55,P2);txt(s,b,.98,5.35,11.35,1.1,13,T)
+def image_layout(s,item,b,imgs,i,p):
+ B,P,P2,A,T,M,G=p;box(s,.82,2.25,4.15,4.45,P);txt(s,b,1.02,2.5,3.75,3.9,14,T);box(s,5.2,2.25,7.35,4.45,P2);img=imgs[(i+1)%len(imgs)] if imgs else None
+ if img and image(s,img,5.42,2.48,6.9,3.5):txt(s,img.get("title","Illustration"),5.45,6.1,6.7,.35,9,M)
+ else:box(s,6.05,3,2.1,2.1,A);box(s,8.05,4,2,1.5,G);txt(s,str(item.get("visual","VISUAL SUMMARY")).upper(),5.55,5.8,6.6,.4,12,T,True)
+def closing(s,item,b,p):
+ B,P,P2,A,T,M,G=p;box(s,.82,2.25,11.7,4.45,P);txt(s,"CONCLUSION",1.2,2.62,3,.4,11,G,True);txt(s,b,1.2,3.2,9.9,2.5,23,T,True);take=str(item.get("takeaway") or item.get("highlight") or "")
+ if take:txt(s,take,1.2,5.8,9.9,.6,13,A)
+def footer(s,n,total,p):
+ B,P,P2,A,T,M,G=p;box(s,.72,7.05,.42,.035,A,False);txt(s,"PRESENT-MAKER",.78,7.12,2.5,.18,8,M,True,margin=0);txt(s,f"{n:02d} / {total:02d}",11.65,7.08,1,.22,9,M,margin=0)
+def sources_slide(prs,sources,p):
+ B,P,P2,A,T,M,G=p;s=prs.slides.add_slide(prs.slide_layouts[6]);bg(s,B);txt(s,"Sources & further reading",.82,.65,11.6,.8,28,T,True);txt(s,"Reading status is an extraction label, not independent verification.",.85,1.5,11.4,.45,11,M);y=2.05
+ for i,src in enumerate(sources[:14],1):
+  if y>.6+6.2:break
+  txt(s,f"[S{i}] {src.get('title','Source')} · {src.get('read_status','status unknown')}",.95,y,11.1,.28,10,T,True);txt(s,str(src.get("url",""))[:170],.95,y+.3,11.1,.24,8,A);y+=.65
+ footer(s,len(prs.slides),len(prs.slides),p)
 def create_pptx(topic,lang,content,sources,output_path,settings=None):
-    settings = settings or {}
-    with _RENDER_LOCK:
-        return _create_pptx_with_theme(topic, lang, content, sources, output_path, settings)
-
-
-def _create_pptx_with_theme(topic,lang,content,sources,output_path,settings):
-    global BG, PANEL, PANEL2, ACCENT, WHITE, MUTED, GREEN
-    palettes = {
-        "dark": (RGBColor(12,18,32), RGBColor(24,34,54), RGBColor(31,45,70), RGBColor(102,183,255), RGBColor(246,248,252), RGBColor(174,188,210), RGBColor(123,226,191)),
-        "academic": (RGBColor(19,35,56), RGBColor(29,49,72), RGBColor(39,62,87), RGBColor(210,170,91), RGBColor(250,248,241), RGBColor(195,203,211), RGBColor(164,199,177)),
-        "minimal": (RGBColor(248,249,251), RGBColor(255,255,255), RGBColor(235,239,244), RGBColor(39,91,140), RGBColor(30,38,48), RGBColor(100,112,125), RGBColor(38,125,103)),
-        "colorful": (RGBColor(29,20,56), RGBColor(47,34,81), RGBColor(67,47,105), RGBColor(255,112,92), RGBColor(255,250,247), RGBColor(218,204,230), RGBColor(111,222,190)),
-        "classic": (RGBColor(250,247,239), RGBColor(255,255,255), RGBColor(238,231,216), RGBColor(38,83,112), RGBColor(37,43,49), RGBColor(104,109,111), RGBColor(73,124,93)),
-    }
-    BG, PANEL, PANEL2, ACCENT, WHITE, MUTED, GREEN = palettes.get(settings.get("style", "dark"), palettes["dark"])
-    prs=Presentation(); prs.slide_width=Inches(13.333); prs.slide_height=Inches(7.5)
-    title=content.get("title") or topic; subtitle=content.get("subtitle") or "Research-based study notes"
-    images=[s for s in sources if s.get("source_type")=="image"]
-    slide=prs.slides.add_slide(prs.slide_layouts[6]); background(slide); rect(slide,8.65,.55,4,6.35,PANEL)
-    for i,height in enumerate([1.2,2.25,1.55,3.2,2.45,3.8]): rect(slide,9.05+i*.48,5.8-height,.22,height,ACCENT if i in (1,4) else PANEL2,False)
-    if images:add_image(slide,images[0],9.05,1.0,3.15,2.0)
-    add_text(slide,"FIELD NOTES / RESEARCH",.82,.82,7.1,.4,11,ACCENT,True)
-    add_text(slide,title,.82,1.72,7.25,2.5,34,WHITE,True)
-    add_text(slide,subtitle,.86,4.55,6.8,1.0,17,MUTED)
-    add_text(slide,"Explanatory study notes based on collected sources",.86,6.55,7.1,.35,10,MUTED)
-
-    slides=content.get("slides",[])
-    for idx,item in enumerate(slides):
-        slide=prs.slides.add_slide(prs.slide_layouts[6]); background(slide); rect(slide,.7,.68,.1,.62,ACCENT,False)
-        add_text(slide,f"{idx+1:02d} / {len(slides):02d}",11.5,.58,1,.3,10,MUTED)
-        add_text(slide,item.get("title","Key idea"),.98,.62,10.7,.85,25,WHITE,True)
-        rect(slide,.85,1.65,7.75,4.95,PANEL)
-        body=(item.get("body") or "\n\n".join(str(x) for x in item.get("bullets",[]))).strip()
-        if not body:
-            body = "\n\n".join(
-                str(item.get(key, "")).strip()
-                for key in ("example", "takeaway", "highlight")
-                if str(item.get(key, "")).strip()
-            )
-        if not body:
-            raise ValueError(f"Слайд {idx + 1} «{item.get('title', 'Без названия')}» пустой; PPTX не сохранён.")
-        words=len(body.split()); body_size=16 if words<90 else 14.5 if words<125 else 13 if words<165 else 11.5
-        add_text(slide,body,1.12,1.92,7.2,4.38,body_size,WHITE)
-        rect(slide,8.9,1.65,3.55,4.95,RGBColor(17,27,45))
-        img=images[(idx+1)%len(images)] if images and settings.get("visuals", "mixed") != "text" else None
-        if img and add_image(slide,img,9.18,1.95,2.98,1.72):
-            add_text(slide,f"Image: {img.get('license','see source page')}",9.18,3.72,3,.25,8,MUTED)
-            cy=4.08
-        else:
-            add_text(slide,str(item.get("visual","KEY IDEA")).upper(),9.18,2.02,2.9,.3,10,GREEN,True)
-            cy=2.5
-        example=str(item.get("example","")).strip()
-        if example:
-            add_text(slide,"EXAMPLE",9.18,cy,2.9,.28,9,ACCENT,True)
-            add_text(slide,example,9.18,cy+.34,2.95,1.05,11,WHITE)
-            cy+=1.52
-        takeaway=str(item.get("takeaway") or item.get("highlight") or "").strip()
-        if takeaway:
-            add_text(slide,"MAIN IDEA",9.18,cy,2.9,.28,9,GREEN,True)
-            add_text(slide,takeaway,9.18,cy+.34,2.95,max(.75,6.25-cy),11,MUTED,True)
-        notes=str(item.get("speaker_notes","")).strip()
-        if notes:
-            try: slide.notes_slide.notes_text_frame.text=notes
-            except Exception: pass
-        evidence=item.get("evidence",[])
-        if evidence:add_text(slide,"Evidence: "+", ".join(evidence),.95,6.68,8,.22,8,MUTED)
-        add_text(slide,"PRESENTATION / STUDY NOTES",.9,7.05,4.8,.2,8,MUTED)
-
-    slide=prs.slides.add_slide(prs.slide_layouts[6]); background(slide); rect(slide,.7,.68,.1,.62,ACCENT,False)
-    add_text(slide,"Sources & reading status",.98,.68,11,.8,27,WHITE,True)
-    add_text(slide,"Reading status describes what the bot could extract; it does not guarantee every claim is verified.",1,1.55,11,.45,11,MUTED)
-    y=2.1
-    for i,source in enumerate(sources[:15],1):
-        titleline=f"[S{i}] {source.get('title','Source')} — {source.get('read_status','status unknown')}"
-        add_text(slide,titleline[:145],1,y,11,.28,10,WHITE,True)
-        add_text(slide,source.get("url","")[:150],1,y+.27,11,.25,8,ACCENT)
-        if source.get("source_type")=="image":
-            add_text(slide,f"Image license: {source.get('license','see original page')}",1,y+.49,10.9,.2,8,MUTED); y+=.72
-        else:y+=.57
-        if y>6.8:break
-    output_path=Path(output_path); output_path.parent.mkdir(parents=True,exist_ok=True); prs.save(output_path)
+ settings=settings or {}
+ with LOCK:return render(topic,lang,content,sources,output_path,settings)
+def render(topic,lang,content,sources,output_path,settings):
+ p=PALETTES.get(settings.get("style","dark"),PALETTES["dark"]);B,P,P2,A,T,M,G=p;prs=Presentation();prs.slide_width=Inches(13.333);prs.slide_height=Inches(7.5);items=content.get("slides") or []
+ if not items:raise ValueError("AI returned no slides.")
+ imgs=[src for src in sources if src.get("source_type")=="image"];cover(prs,topic,content,imgs,p)
+ for i,item in enumerate(items):
+  s=prs.slides.add_slide(prs.slide_layouts[6]);bg(s,B);header(s,item,i,p);b=body_of(item);l=layout_of(item,i)
+  if l=="cards":cards(s,item,b,p)
+  elif l=="compare":compare(s,item,b,p)
+  elif l=="timeline":timeline(s,item,b,p)
+  elif l=="quote":quote(s,item,b,p)
+  elif l=="stats":stats(s,item,b,p)
+  elif l=="image":image_layout(s,item,b,imgs,i,p)
+  elif l=="closing":closing(s,item,b,p)
+  else:split(s,item,b,imgs,i,p)
+  notes=str(item.get("speaker_notes","")).strip()
+  if notes:
+   try:s.notes_slide.notes_text_frame.text=notes
+   except Exception:pass
+  ev=item.get("evidence",[])
+  if ev:txt(s,"Sources: "+", ".join(map(str,ev)),.82,6.78,9.5,.2,8,M,margin=0)
+  footer(s,i+1,len(items),p)
+ sources_slide(prs,sources,p);output_path=Path(output_path);output_path.parent.mkdir(parents=True,exist_ok=True);prs.save(output_path);return output_path
